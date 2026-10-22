@@ -31,6 +31,25 @@ with db() as c:
  CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY,recipient INTEGER REFERENCES users(id),actor INTEGER REFERENCES users(id),kind TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX IF NOT EXISTS idx_notifications ON notifications(recipient,id DESC);
  CREATE INDEX IF NOT EXISTS idx_stories ON stories(created DESC);""")
+# Upgrade databases created by earlier Pulse versions without deleting accounts.
+with db() as c:
+ for table, columns in {
+  'users': [('verified', 'INTEGER NOT NULL DEFAULT 0'), ('banned', 'INTEGER NOT NULL DEFAULT 0')],
+  'posts': [('pinned', 'INTEGER NOT NULL DEFAULT 0')],
+ }.items():
+  existing={r['name'] for r in c.execute(f'PRAGMA table_info({table})')}
+  for column, definition in columns:
+   if column not in existing:
+    c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+ c.execute('''CREATE TABLE IF NOT EXISTS reports(
+  id INTEGER PRIMARY KEY, reporter_id INTEGER NOT NULL REFERENCES users(id),
+  post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL,
+  reason TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL)''')
+
+def is_admin(row):
+ return row is not None and bool(ADMIN_ID) and str(row['id']) == ADMIN_ID
+
 def notify(c,recipient,actor,kind,detail=''):
  if recipient!=actor:c.execute('INSERT INTO notifications(recipient,actor,kind,detail,created) VALUES(?,?,?,?,?)',(recipient,actor,kind,str(detail)[:100],now()))
 def now():return int(time.time())
@@ -64,7 +83,7 @@ class App(BaseHTTPRequestHandler):
  def do_GET(self):
   path=urlparse(self.path).path
   if path=='/' or path.startswith('/static/') or path.startswith('/uploads/'):
-   target=ROOT/'static'/'index.html' if path=='/' else ROOT/path.lstrip('/')
+   target=ROOT/'static'/'index.html' if path=='/' else (UP/Path(path).name if path.startswith('/uploads/') else ROOT/path.lstrip('/'))
    target=target.resolve()
    if not (target.is_relative_to((ROOT/'static').resolve()) or target.is_relative_to(UP.resolve())) or not target.is_file():return self.send_error(404)
    mime=mimetypes.guess_type(str(target))[0] or 'application/octet-stream';data=target.read_bytes();self.send_response(200);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(data)));self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data);return
