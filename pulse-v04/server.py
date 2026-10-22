@@ -34,7 +34,16 @@ with db() as c:
 def notify(c,recipient,actor,kind,detail=''):
  if recipient!=actor:c.execute('INSERT INTO notifications(recipient,actor,kind,detail,created) VALUES(?,?,?,?,?)',(recipient,actor,kind,str(detail)[:100],now()))
 def now():return int(time.time())
-def public_user(row):return dict(id=row['id'],username=row['username'],name=row['name'],bio=row['bio'],verified=bool(row['verified']),admin=is_admin(row))
+def public_user(row):
+    keys = row.keys()
+    return dict(
+        id=row['id'],
+        username=row['username'],
+        name=row['name'],
+        bio=row['bio'],
+        verified=bool(row['verified']) if 'verified' in keys else False,
+        admin=is_admin(row)
+    )
 class App(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def send(self,code,data,headers=None):
