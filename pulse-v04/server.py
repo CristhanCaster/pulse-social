@@ -1,4 +1,4 @@
-import os, json, secrets, hashlib, hmac, mimetypes, time, threading
+import re, os, json, secrets, hashlib, hmac, mimetypes, time, threading
 from collections import defaultdict, deque
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -47,6 +47,9 @@ def init_db():
   c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER NOT NULL DEFAULT 0')
   c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS banned INTEGER NOT NULL DEFAULT 0')
   c.execute('ALTER TABLE posts ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0')
+  c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT ''")
+  c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banner TEXT NOT NULL DEFAULT ''")
+  c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS website TEXT NOT NULL DEFAULT ''")
 
 def is_admin(row):
  return row is not None and bool(ADMIN_ID) and str(row['id']) == ADMIN_ID
@@ -61,6 +64,10 @@ def public_user(row):
         username=row['username'],
         name=row['name'],
         bio=row['bio'],
+        avatar=row.get('avatar',''),
+        banner=row.get('banner',''),
+        website=row.get('website',''),
+        created=row['created'],
         verified=bool(row['verified']) if 'verified' in keys else False,
         admin=is_admin(row)
     )
@@ -99,6 +106,26 @@ class App(BaseHTTPRequestHandler):
     reports=c.execute('SELECT r.*,u.username AS reporter_name,p.body AS post_body FROM reports r JOIN users u ON u.id=r.reporter_id LEFT JOIN posts p ON p.id=r.post_id WHERE r.resolved=0 ORDER BY r.id DESC LIMIT 100').fetchall()
     people=c.execute('SELECT id,username,name,verified,banned FROM users ORDER BY id DESC LIMIT 100').fetchall()
     return self.send(200,{'counts':counts,'reports':reports,'users':people})
+   if path=='/api/profile-view':
+    username=q.get('username',[''])[0].strip().lower()
+    if not username:return self.fail('Username required')
+    u=c.execute('SELECT * FROM users WHERE username=%s',(username,)).fetchone()
+    if not u:return self.fail('User not found',404)
+    uid=u['id']
+    stats=c.execute('SELECT (SELECT COUNT(*) FROM posts WHERE user_id=%s) AS posts,(SELECT COUNT(*) FROM follows WHERE followed=%s) AS followers,(SELECT COUNT(*) FROM follows WHERE follower=%s) AS following',(uid,uid,uid)).fetchone()
+    follow=bool(c.execute('SELECT 1 FROM follows WHERE follower=%s AND followed=%s',(me['id'],uid)).fetchone())
+    rows=c.execute("""SELECT p.*,u.username,u.name,u.bio,u.verified,u.avatar,p.pinned,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) likes,(SELECT COUNT(*) FROM comments WHERE post_id=p.id) comments,EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=%s) liked,EXISTS(SELECT 1 FROM follows WHERE follower=%s AND followed=p.user_id) following,EXISTS(SELECT 1 FROM bookmarks WHERE user_id=%s AND post_id=p.id) bookmarked FROM posts p JOIN users u ON u.id=p.user_id WHERE p.user_id=%s ORDER BY p.pinned DESC,p.created DESC,p.id DESC LIMIT 100""",(me['id'],me['id'],me['id'],uid)).fetchall()
+    return self.send(200,{'user':public_user(u),'stats':stats,'following':follow,'posts':rows})
+   if path=='/api/profile-connections':
+    username=q.get('username',[''])[0].strip().lower();kind=q.get('kind',['followers'])[0]
+    if kind not in ('followers','following'):return self.fail('Invalid list')
+    u=c.execute('SELECT id FROM users WHERE username=%s',(username,)).fetchone()
+    if not u:return self.fail('User not found',404)
+    if kind=='followers':
+     rows=c.execute('SELECT users.* FROM follows JOIN users ON users.id=follows.follower WHERE follows.followed=%s ORDER BY users.id DESC LIMIT 100',(u['id'],)).fetchall()
+    else:
+     rows=c.execute('SELECT users.* FROM follows JOIN users ON users.id=follows.followed WHERE follows.follower=%s ORDER BY users.id DESC LIMIT 100',(u['id'],)).fetchall()
+    return self.send(200,{'users':[public_user(r) for r in rows]})
    if path=='/api/notifications':
     rows=c.execute('SELECT n.*,u.username,u.name FROM notifications n JOIN users u ON u.id=n.actor WHERE n.recipient=%s ORDER BY n.id DESC LIMIT 100',(me['id'],)).fetchall()
     return self.send(200,{'notifications':[dict(r) for r in rows]})
@@ -119,12 +146,12 @@ class App(BaseHTTPRequestHandler):
     if mode=='following':filter=' AND (p.user_id=%s OR p.user_id IN (SELECT followed FROM follows WHERE follower=%s))';params += [me['id'],me['id']]
     if mode=='clips':filter+=" AND p.kind='clip'"
     if search:filter+=' AND (p.body LIKE %s OR u.username LIKE %s)';params += ['%'+search+'%','%'+search+'%']
-    rows=c.execute('''SELECT p.*,u.username,u.name,u.bio,u.verified,p.pinned,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) likes,(SELECT COUNT(*) FROM comments WHERE post_id=p.id) comments,EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=%s) liked,EXISTS(SELECT 1 FROM follows WHERE follower=%s AND followed=p.user_id) following,EXISTS(SELECT 1 FROM bookmarks WHERE user_id=%s AND post_id=p.id) bookmarked FROM posts p JOIN users u ON u.id=p.user_id WHERE 1=1'''+filter+' ORDER BY p.pinned DESC,p.created DESC,p.id DESC LIMIT 100',params).fetchall()
+    rows=c.execute('''SELECT p.*,u.username,u.name,u.bio,u.verified,u.avatar,p.pinned,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) likes,(SELECT COUNT(*) FROM comments WHERE post_id=p.id) comments,EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=%s) liked,EXISTS(SELECT 1 FROM follows WHERE follower=%s AND followed=p.user_id) following,EXISTS(SELECT 1 FROM bookmarks WHERE user_id=%s AND post_id=p.id) bookmarked FROM posts p JOIN users u ON u.id=p.user_id WHERE 1=1'''+filter+' ORDER BY p.pinned DESC,p.created DESC,p.id DESC LIMIT 100',params).fetchall()
     return self.send(200,{'posts':[dict(r) for r in rows]})
    if path=='/api/comments':
     pid=q.get('post',['0'])[0];rows=c.execute('SELECT comments.*,users.username,users.name FROM comments JOIN users ON users.id=comments.user_id WHERE post_id=%s ORDER BY comments.id ASC LIMIT 150',(pid,)).fetchall();return self.send(200,{'comments':[dict(r) for r in rows]})
    if path=='/api/bookmarks':
-    rows=c.execute('SELECT p.*,u.username,u.name,u.bio,u.verified,p.pinned,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) likes,(SELECT COUNT(*) FROM comments WHERE post_id=p.id) comments,EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=%s) liked,EXISTS(SELECT 1 FROM follows WHERE follower=%s AND followed=p.user_id) following,1 bookmarked FROM bookmarks b JOIN posts p ON p.id=b.post_id JOIN users u ON u.id=p.user_id WHERE b.user_id=%s ORDER BY b.post_id DESC LIMIT 100',(me['id'],me['id'],me['id'])).fetchall()
+    rows=c.execute('SELECT p.*,u.username,u.name,u.bio,u.verified,u.avatar,p.pinned,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) likes,(SELECT COUNT(*) FROM comments WHERE post_id=p.id) comments,EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=%s) liked,EXISTS(SELECT 1 FROM follows WHERE follower=%s AND followed=p.user_id) following,1 bookmarked FROM bookmarks b JOIN posts p ON p.id=b.post_id JOIN users u ON u.id=p.user_id WHERE b.user_id=%s ORDER BY b.post_id DESC LIMIT 100',(me['id'],me['id'],me['id'])).fetchall()
     return self.send(200,{'posts':[dict(r) for r in rows]})
    if path=='/api/messages':
     other=q.get('user',['0'])[0];rows=c.execute('SELECT * FROM messages WHERE (sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s) ORDER BY id DESC LIMIT 100',(me['id'],other,other,me['id'])).fetchall();return self.send(200,{'messages':[dict(r) for r in reversed(rows)]})
@@ -249,7 +276,11 @@ class App(BaseHTTPRequestHandler):
    if path=='/api/profile':
     name=str(data.get('name','')).strip()[:40];bio=str(data.get('bio','')).strip()[:200]
     if not name:return self.fail('Name required')
-    c.execute('UPDATE users SET name=%s,bio=%s WHERE id=%s',(name,bio,uid));return self.send(200,{'ok':True})
+    avatar=str(data.get('avatar','')).strip();banner=str(data.get('banner','')).strip();website=str(data.get('website','')).strip()[:200]
+    for media in (avatar,banner):
+     if media and (not re.fullmatch(r'/uploads/[a-f0-9]{36}\.(?:png|jpg|webp|gif)',media) or not (UP/Path(media).name).is_file()):return self.fail('Invalid profile image')
+    if website and not (website.startswith('https://') or website.startswith('http://')):return self.fail('Website must start with https:// or http://')
+    c.execute('UPDATE users SET name=%s,bio=%s,avatar=%s,banner=%s,website=%s WHERE id=%s',(name,bio,avatar,banner,website,uid));return self.send(200,{'ok':True})
    return self.fail('Not found',404)
  def login(self,c,u):
   token=secrets.token_urlsafe(32);c.execute('INSERT INTO sessions VALUES(%s,%s,%s)',(token,u['id'],now()+60*60*24*14));secure='; Secure' if self.headers.get('X-Forwarded-Proto','').lower()=='https' else '';return self.send(200,{'user':public_user(u)},{'Set-Cookie':f'pulse_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}'})
