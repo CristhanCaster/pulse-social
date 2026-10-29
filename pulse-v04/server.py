@@ -34,6 +34,12 @@ SCHEMA = [
  "CREATE TABLE IF NOT EXISTS community_posts(id BIGSERIAL PRIMARY KEY,community_id BIGINT REFERENCES communities(id) ON DELETE CASCADE,user_id BIGINT REFERENCES users(id),body TEXT NOT NULL,created BIGINT NOT NULL)",
  "CREATE TABLE IF NOT EXISTS notifications(id BIGSERIAL PRIMARY KEY,recipient BIGINT REFERENCES users(id),actor BIGINT REFERENCES users(id),kind TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created BIGINT NOT NULL,seen INTEGER NOT NULL DEFAULT 0)",
  "CREATE TABLE IF NOT EXISTS reports(id BIGSERIAL PRIMARY KEY,reporter_id BIGINT NOT NULL REFERENCES users(id),post_id BIGINT REFERENCES posts(id) ON DELETE SET NULL,reason TEXT NOT NULL,resolved INTEGER NOT NULL DEFAULT 0,created BIGINT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS chat_groups(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,owner BIGINT NOT NULL REFERENCES users(id),created BIGINT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS chat_members(group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,user_id BIGINT NOT NULL REFERENCES users(id),PRIMARY KEY(group_id,user_id))",
+ "CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY,group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,user_id BIGINT NOT NULL REFERENCES users(id),body TEXT NOT NULL,created BIGINT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS voice_signals(id BIGSERIAL PRIMARY KEY,group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,sender BIGINT NOT NULL REFERENCES users(id),recipient BIGINT NOT NULL REFERENCES users(id),payload TEXT NOT NULL,created BIGINT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS voice_presence(group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,user_id BIGINT NOT NULL REFERENCES users(id),updated BIGINT NOT NULL,PRIMARY KEY(group_id,user_id))",
+ "CREATE TABLE IF NOT EXISTS site_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
  "CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created DESC)",
  "CREATE INDEX IF NOT EXISTS idx_msg ON messages(sender,recipient,created)",
  "CREATE INDEX IF NOT EXISTS idx_notifications ON notifications(recipient,id DESC)",
@@ -100,6 +106,27 @@ class App(BaseHTTPRequestHandler):
    if path=='/api/me':return self.send(200,{'user':public_user(me) if me else None})
    if not me:return self.fail('Log in first',401)
    q=parse_qs(urlparse(self.path).query)
+   if path=='/api/site-settings':
+    rows=c.execute('SELECT key,value FROM site_settings').fetchall()
+    return self.send(200,{'settings':{r['key']:r['value'] for r in rows}})
+   if path=='/api/group-list':
+    rows=c.execute('SELECT g.*, (SELECT COUNT(*) FROM chat_members m WHERE m.group_id=g.id) AS members FROM chat_groups g JOIN chat_members mine ON mine.group_id=g.id AND mine.user_id=%s ORDER BY g.id DESC',(me['id'],)).fetchall()
+    return self.send(200,{'groups':rows})
+   if path=='/api/group-detail':
+    try:gid=int(q.get('id',['0'])[0])
+    except ValueError:return self.fail('Invalid group')
+    if not c.execute('SELECT 1 FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,me['id'])).fetchone():return self.fail('Not a member',403)
+    group=c.execute('SELECT * FROM chat_groups WHERE id=%s',(gid,)).fetchone()
+    members=c.execute('SELECT u.id,u.username,u.name,u.avatar FROM chat_members m JOIN users u ON u.id=m.user_id WHERE m.group_id=%s ORDER BY u.username',(gid,)).fetchall()
+    messages=c.execute('SELECT m.id,m.body,m.created,m.user_id,u.username,u.name FROM chat_messages m JOIN users u ON u.id=m.user_id WHERE m.group_id=%s ORDER BY m.id DESC LIMIT 100',(gid,)).fetchall()
+    voice=c.execute('SELECT u.id,u.username FROM voice_presence v JOIN users u ON u.id=v.user_id WHERE v.group_id=%s AND v.updated>%s',(gid,now()-35)).fetchall()
+    return self.send(200,{'group':group,'members':members,'messages':list(reversed(messages)),'voice':voice})
+   if path=='/api/voice-signals':
+    try:gid=int(q.get('group',['0'])[0]);after=int(q.get('after',['0'])[0])
+    except ValueError:return self.fail('Invalid query')
+    if not c.execute('SELECT 1 FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,me['id'])).fetchone():return self.fail('Not a member',403)
+    rows=c.execute('SELECT id,sender,payload FROM voice_signals WHERE group_id=%s AND recipient=%s AND id>%s AND created>%s ORDER BY id LIMIT 100',(gid,me['id'],after,now()-120)).fetchall()
+    return self.send(200,{'signals':rows})
    if path=='/api/admin/overview':
     if not is_admin(me):return self.fail('Admin only',403)
     counts={table:c.execute('SELECT COUNT(*) AS n FROM '+table).fetchone()['n'] for table in ('users','posts','reports')}
@@ -190,6 +217,55 @@ class App(BaseHTTPRequestHandler):
     if token:c.execute('DELETE FROM sessions WHERE token=%s',(token.value,))
     return self.send(200,{'ok':True},{'Set-Cookie':'pulse_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'})
    if not me:return self.fail('Log in first',401)
+   if path=='/api/group-create':
+    name=str(data.get('name','')).strip()[:60]
+    if len(name)<2:return self.fail('Group name must be at least 2 characters')
+    gid=c.execute('INSERT INTO chat_groups(name,owner,created) VALUES(%s,%s,%s) RETURNING id',(name,me['id'],now())).fetchone()['id']
+    c.execute('INSERT INTO chat_members(group_id,user_id) VALUES(%s,%s)',(gid,me['id']))
+    return self.send(200,{'id':gid})
+   if path in ('/api/group-invite','/api/group-message','/api/group-leave','/api/voice-presence','/api/voice-signal'):
+    try:gid=int(data.get('group',0))
+    except (ValueError,TypeError):return self.fail('Invalid group')
+    if not c.execute('SELECT 1 FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,me['id'])).fetchone():return self.fail('Not a member',403)
+    if path=='/api/group-invite':
+     username=str(data.get('username','')).strip().lower()
+     person=c.execute('SELECT id FROM users WHERE username=%s',(username,)).fetchone()
+     if not person:return self.fail('User not found',404)
+     if c.execute('SELECT 1 FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,person['id'])).fetchone():return self.fail('Already in group')
+     c.execute('INSERT INTO chat_members(group_id,user_id) VALUES(%s,%s)',(gid,person['id']))
+     notify(c,person['id'],me['id'],'group','Added you to a group chat')
+     return self.send(200,{'ok':True})
+    if path=='/api/group-message':
+     msg=str(data.get('body','')).strip()
+     if not msg or len(msg)>2000:return self.fail('Message must be 1–2000 characters')
+     c.execute('INSERT INTO chat_messages(group_id,user_id,body,created) VALUES(%s,%s,%s,%s)',(gid,me['id'],msg,now()))
+     return self.send(200,{'ok':True})
+    if path=='/api/group-leave':
+     c.execute('DELETE FROM voice_presence WHERE group_id=%s AND user_id=%s',(gid,me['id']))
+     c.execute('DELETE FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,me['id']))
+     return self.send(200,{'ok':True})
+    if path=='/api/voice-presence':
+     if data.get('active'):
+      c.execute('INSERT INTO voice_presence(group_id,user_id,updated) VALUES(%s,%s,%s) ON CONFLICT(group_id,user_id) DO UPDATE SET updated=EXCLUDED.updated',(gid,me['id'],now()))
+     else:c.execute('DELETE FROM voice_presence WHERE group_id=%s AND user_id=%s',(gid,me['id']))
+     return self.send(200,{'ok':True})
+    if path=='/api/voice-signal':
+     try:recipient=int(data.get('recipient',0))
+     except (ValueError,TypeError):return self.fail('Invalid recipient')
+     if recipient==me['id'] or not c.execute('SELECT 1 FROM chat_members WHERE group_id=%s AND user_id=%s',(gid,recipient)).fetchone():return self.fail('Invalid recipient',403)
+     payload=json.dumps(data.get('payload'))
+     if len(payload)>16000:return self.fail('Signal too large')
+     c.execute('INSERT INTO voice_signals(group_id,sender,recipient,payload,created) VALUES(%s,%s,%s,%s,%s)',(gid,me['id'],recipient,payload,now()))
+     return self.send(200,{'ok':True})
+   if path=='/api/admin/site-settings':
+    if not is_admin(me):return self.fail('Admin only',403)
+    key=str(data.get('key',''))
+    if key not in ('announcement','theme'):return self.fail('Invalid setting')
+    value=str(data.get('value','')).strip()
+    if key=='announcement' and len(value)>240:return self.fail('Announcement too long')
+    if key=='theme' and value not in ('purple','blue','green','pink','orange','red'):return self.fail('Invalid theme')
+    c.execute('INSERT INTO site_settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',(key,value))
+    return self.send(200,{'ok':True})
    if path=='/api/report':
     pid=data.get('post');reason=str(data.get('reason','')).strip()[:500]
     if not reason:return self.fail('Report reason required')
