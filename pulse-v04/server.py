@@ -390,8 +390,14 @@ class App(BaseHTTPRequestHandler):
     name=str(data.get('name','')).strip()[:40];bio=str(data.get('bio','')).strip()[:200]
     if not name:return self.fail('Name required')
     avatar=str(data.get('avatar','')).strip();banner=str(data.get('banner','')).strip();website=str(data.get('website','')).strip()[:200]
-    for media in (avatar,banner):
-     if media and (not re.fullmatch(r'/uploads/[a-f0-9]{36}\.(?:png|jpg|webp|gif)',media) or not (c.execute('SELECT 1 FROM media_files WHERE name=%s',(Path(media).name,)).fetchone() or (UP/Path(media).name).is_file())):return self.fail('Invalid profile image')
+    # Existing legacy image URLs may point to files lost on Render's ephemeral disk.
+    # Permit an unchanged legacy URL so saving a new avatar doesn't fail because of an old banner.
+    current=c.execute('SELECT avatar,banner FROM users WHERE id=%s',(uid,)).fetchone()
+    for field,media in (('avatar',avatar),('banner',banner)):
+     if not media:continue
+     if media == (current[field] or ''):continue
+     if not re.fullmatch(r'/uploads/[a-f0-9]{36}\.(?:png|jpg|webp|gif)',media):return self.fail('Invalid profile image')
+     if not c.execute('SELECT 1 FROM media_files WHERE name=%s AND owner_id=%s',(Path(media).name,uid)).fetchone():return self.fail('Invalid profile image')
     if website and not (website.startswith('https://') or website.startswith('http://')):return self.fail('Website must start with https:// or http://')
     c.execute('UPDATE users SET name=%s,bio=%s,avatar=%s,banner=%s,website=%s WHERE id=%s',(name,bio,avatar,banner,website,uid));return self.send(200,{'ok':True})
    return self.fail('Not found',404)
