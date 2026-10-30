@@ -40,6 +40,7 @@ SCHEMA = [
  "CREATE TABLE IF NOT EXISTS voice_signals(id BIGSERIAL PRIMARY KEY,group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,sender BIGINT NOT NULL REFERENCES users(id),recipient BIGINT NOT NULL REFERENCES users(id),payload TEXT NOT NULL,created BIGINT NOT NULL)",
  "CREATE TABLE IF NOT EXISTS voice_presence(group_id BIGINT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,user_id BIGINT NOT NULL REFERENCES users(id),updated BIGINT NOT NULL,PRIMARY KEY(group_id,user_id))",
  "CREATE TABLE IF NOT EXISTS site_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+ "CREATE TABLE IF NOT EXISTS media_files(name TEXT PRIMARY KEY, owner_id BIGINT REFERENCES users(id) ON DELETE SET NULL, mime TEXT NOT NULL, content BYTEA NOT NULL, created BIGINT NOT NULL)",
  "CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created DESC)",
  "CREATE INDEX IF NOT EXISTS idx_msg ON messages(sender,recipient,created)",
  "CREATE INDEX IF NOT EXISTS idx_notifications ON notifications(recipient,id DESC)",
@@ -56,6 +57,17 @@ def init_db():
   c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT ''")
   c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banner TEXT NOT NULL DEFAULT ''")
   c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS website TEXT NOT NULL DEFAULT ''")
+  c.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS request_id TEXT")
+  c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_request_id ON posts(user_id,request_id) WHERE request_id IS NOT NULL")
+
+def migrate_legacy_media():
+ # Only files still present on the running host can be recovered.
+ with db() as c:
+  for file in UP.iterdir():
+   if not file.is_file() or not re.fullmatch(r'[a-f0-9]{36}\.(?:png|jpg|webp|gif|mp4|webm)',file.name):continue
+   if file.stat().st_size>MAX:continue
+   mime=mimetypes.guess_type(file.name)[0] or 'application/octet-stream'
+   c.execute('INSERT INTO media_files(name,owner_id,mime,content,created) VALUES(%s,NULL,%s,%s,%s) ON CONFLICT(name) DO NOTHING',(file.name,mime,file.read_bytes(),now()))
 
 def is_admin(row):
  return row is not None and bool(ADMIN_ID) and str(row['id']) == ADMIN_ID
@@ -96,10 +108,30 @@ class App(BaseHTTPRequestHandler):
   return self.rfile.read(size)
  def do_GET(self):
   path=urlparse(self.path).path
-  if path=='/' or path.startswith('/static/') or path.startswith('/uploads/'):
-   target=ROOT/'static'/'index.html' if path=='/' else (UP/Path(path).name if path.startswith('/uploads/') else ROOT/path.lstrip('/'))
-   target=target.resolve()
-   if not (target.is_relative_to((ROOT/'static').resolve()) or target.is_relative_to(UP.resolve())) or not target.is_file():return self.send_error(404)
+  if path.startswith('/uploads/'):
+   name=path[len('/uploads/'):]
+   if not re.fullmatch(r'[a-f0-9]{36}\.(?:png|jpg|webp|gif|mp4|webm)',name):return self.send_error(404)
+   with db() as c:
+    item=c.execute('SELECT mime,content FROM media_files WHERE name=%s',(name,)).fetchone()
+   if item:
+    data=bytes(item['content']);self.send_response(200)
+    self.send_header('Content-Type',item['mime'])
+    self.send_header('Content-Length',str(len(data)))
+    self.send_header('X-Content-Type-Options','nosniff')
+    self.send_header('Cache-Control','public, max-age=86400')
+    self.end_headers();self.wfile.write(data);return
+   # Legacy uploads may still be available until Render's next restart.
+   legacy=UP/name
+   if legacy.is_file():
+    data=legacy.read_bytes();self.send_response(200)
+    self.send_header('Content-Type',mimetypes.guess_type(name)[0] or 'application/octet-stream')
+    self.send_header('Content-Length',str(len(data)))
+    self.send_header('X-Content-Type-Options','nosniff')
+    self.end_headers();self.wfile.write(data);return
+   return self.send_error(404)
+  if path=='/' or path.startswith('/static/'):
+   target=(ROOT/'static'/'index.html' if path=='/' else ROOT/path.lstrip('/')).resolve()
+   if not target.is_relative_to((ROOT/'static').resolve()) or not target.is_file():return self.send_error(404)
    mime=mimetypes.guess_type(str(target))[0] or 'application/octet-stream';data=target.read_bytes();self.send_response(200);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(data)));self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data);return
   with db() as c:
    me=self.identity(c)
@@ -195,7 +227,7 @@ class App(BaseHTTPRequestHandler):
     if not ext or not raw:return self.fail('Use PNG, JPEG, WebP, GIF, MP4, or WebM')
     sig={'.png':raw.startswith(b'\x89PNG\r\n\x1a\n'),'.jpg':raw.startswith(b'\xff\xd8\xff'),'.webp':raw.startswith(b'RIFF') and raw[8:12]==b'WEBP','.gif':raw.startswith((b'GIF87a',b'GIF89a')),'.mp4':raw[4:8]==b'ftyp','.webm':raw.startswith(b'\x1a\x45\xdf\xa3')}
     if not sig[ext]:return self.fail('File does not match selected type')
-    name=secrets.token_hex(18)+ext;(UP/name).write_bytes(raw);return self.send(200,{'url':'/uploads/'+name,'kind':'clip' if ext in ('.mp4','.webm') else 'post'})
+    name=secrets.token_hex(18)+ext;c.execute('INSERT INTO media_files(name,owner_id,mime,content,created) VALUES(%s,%s,%s,%s,%s)',(name,me['id'],mime,raw,now()));return self.send(200,{'url':'/uploads/'+name,'kind':'clip' if ext in ('.mp4','.webm') else 'post'})
    try:data=json.loads(raw or b'{}')
    except Exception:return self.fail('Invalid JSON')
    if not isinstance(data,dict):return self.fail('Invalid request')
@@ -297,7 +329,7 @@ class App(BaseHTTPRequestHandler):
     return self.send(200,{'ok':True})
    if path=='/api/story':
     media=str(data.get('media',''))
-    if media and (not media.startswith('/uploads/') or not (UP/Path(media).name).is_file()):return self.fail('Invalid media')
+    if media and (not media.startswith('/uploads/') or not (c.execute('SELECT 1 FROM media_files WHERE name=%s',(Path(media).name,)).fetchone() or (UP/Path(media).name).is_file())):return self.fail('Invalid media')
     if len(body)>250 or not (body or media):return self.fail('Story needs text or media (max 250 characters)')
     c.execute('INSERT INTO stories(user_id,body,media,created) VALUES(%s,%s,%s,%s)',(uid,body,media,now()));return self.send(200,{'ok':True})
    if path=='/api/community-create':
@@ -321,9 +353,14 @@ class App(BaseHTTPRequestHandler):
     c.execute('UPDATE notifications SET seen=1 WHERE recipient=%s',(uid,));return self.send(200,{'ok':True})
    if path=='/api/posts':
     media=str(data.get('media',''));kind='clip' if media.endswith(('.mp4','.webm')) else 'post'
-    if media and (not media.startswith('/uploads/') or not (UP/Path(media).name).is_file()):return self.fail('Invalid media')
+    if media and (not media.startswith('/uploads/') or not (c.execute('SELECT 1 FROM media_files WHERE name=%s',(Path(media).name,)).fetchone() or (UP/Path(media).name).is_file())):return self.fail('Invalid media')
     if len(body)>1000 or (not body and not media):return self.fail('Write a post (max 1000 characters) or upload media')
-    c.execute('INSERT INTO posts(user_id,body,media,kind,created) VALUES(%s,%s,%s,%s,%s)',(uid,body,media,kind,now()));return self.send(200,{'ok':True})
+    request_id=str(data.get('request_id',''))
+    if request_id and not re.fullmatch(r'[a-zA-Z0-9_-]{8,80}',request_id):return self.fail('Invalid request ID')
+    if request_id:
+     c.execute('INSERT INTO posts(user_id,body,media,kind,created,request_id) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id,request_id) WHERE request_id IS NOT NULL DO NOTHING',(uid,body,media,kind,now(),request_id))
+    else:c.execute('INSERT INTO posts(user_id,body,media,kind,created) VALUES(%s,%s,%s,%s,%s)',(uid,body,media,kind,now()))
+    return self.send(200,{'ok':True})
    if path=='/api/delete':
     pid=data.get('post');c.execute('DELETE FROM posts WHERE id=%s AND user_id=%s',(pid,uid));return self.send(200,{'ok':True})
    if path=='/api/like':
@@ -354,12 +391,13 @@ class App(BaseHTTPRequestHandler):
     if not name:return self.fail('Name required')
     avatar=str(data.get('avatar','')).strip();banner=str(data.get('banner','')).strip();website=str(data.get('website','')).strip()[:200]
     for media in (avatar,banner):
-     if media and (not re.fullmatch(r'/uploads/[a-f0-9]{36}\.(?:png|jpg|webp|gif)',media) or not (UP/Path(media).name).is_file()):return self.fail('Invalid profile image')
+     if media and (not re.fullmatch(r'/uploads/[a-f0-9]{36}\.(?:png|jpg|webp|gif)',media) or not (c.execute('SELECT 1 FROM media_files WHERE name=%s',(Path(media).name,)).fetchone() or (UP/Path(media).name).is_file())):return self.fail('Invalid profile image')
     if website and not (website.startswith('https://') or website.startswith('http://')):return self.fail('Website must start with https:// or http://')
     c.execute('UPDATE users SET name=%s,bio=%s,avatar=%s,banner=%s,website=%s WHERE id=%s',(name,bio,avatar,banner,website,uid));return self.send(200,{'ok':True})
    return self.fail('Not found',404)
  def login(self,c,u):
   token=secrets.token_urlsafe(32);c.execute('INSERT INTO sessions VALUES(%s,%s,%s)',(token,u['id'],now()+60*60*24*14));secure='; Secure' if self.headers.get('X-Forwarded-Proto','').lower()=='https' else '';return self.send(200,{'user':public_user(u)},{'Set-Cookie':f'pulse_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}'})
 init_db()
+migrate_legacy_media()
 if __name__=='__main__':
  port=int(os.environ.get('PORT','8000'));print(f'Pulse v0.5.1 running at http://localhost:{port}');ThreadingHTTPServer(('0.0.0.0',port),App).serve_forever()
