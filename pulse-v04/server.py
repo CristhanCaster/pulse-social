@@ -5,6 +5,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
 import psycopg
+import pulse_live
 from psycopg.rows import dict_row
 from psycopg.errors import UniqueViolation
 ROOT=Path(__file__).resolve().parent
@@ -129,14 +130,15 @@ class App(BaseHTTPRequestHandler):
     self.send_header('X-Content-Type-Options','nosniff')
     self.end_headers();self.wfile.write(data);return
    return self.send_error(404)
-  if path=='/' or path.startswith('/static/'):
-   target=(ROOT/'static'/'index.html' if path=='/' else ROOT/path.lstrip('/')).resolve()
+  if path in ('/', '/live') or path.startswith('/static/'):
+   target=(ROOT/'static'/'index.html' if path=='/' else ROOT/'static'/'live.html' if path=='/live' else ROOT/path.lstrip('/')).resolve()
    if not target.is_relative_to((ROOT/'static').resolve()) or not target.is_file():return self.send_error(404)
    mime=mimetypes.guess_type(str(target))[0] or 'application/octet-stream';data=target.read_bytes();self.send_response(200);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(data)));self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data);return
   with db() as c:
    me=self.identity(c)
    if path=='/api/me':return self.send(200,{'user':public_user(me) if me else None})
    if not me:return self.fail('Log in first',401)
+   if path=='/api/live/list':return pulse_live.handle(self,c,me,'list')
    q=parse_qs(urlparse(self.path).query)
    if path=='/api/site-settings':
     rows=c.execute('SELECT key,value FROM site_settings').fetchall()
@@ -216,7 +218,12 @@ class App(BaseHTTPRequestHandler):
     other=q.get('user',['0'])[0];rows=c.execute('SELECT * FROM messages WHERE (sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s) ORDER BY id DESC LIMIT 100',(me['id'],other,other,me['id'])).fetchall();return self.send(200,{'messages':[dict(r) for r in reversed(rows)]})
    return self.fail('Not found',404)
  def do_POST(self):
-  path=urlparse(self.path).path;raw=self.body()
+  path=urlparse(self.path).path
+  if path.startswith('/api/live/'):
+   try:size=int(self.headers.get('Content-Length','0'))
+   except ValueError:return self.fail('Invalid request length')
+   if not 0<size<=32768:return self.fail('Invalid live request size',413)
+  raw=self.body()
   if raw is None:return self.fail('Upload too large',413)
   with db() as c:
    me=self.identity(c)
@@ -249,6 +256,8 @@ class App(BaseHTTPRequestHandler):
     if token:c.execute('DELETE FROM sessions WHERE token=%s',(token.value,))
     return self.send(200,{'ok':True},{'Set-Cookie':'pulse_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'})
    if not me:return self.fail('Log in first',401)
+   if path.startswith('/api/live/') and path!='/api/live/list':
+    return pulse_live.handle(self,c,me,path.rsplit('/',1)[-1],data)
    if path=='/api/group-create':
     name=str(data.get('name','')).strip()[:60]
     if len(name)<2:return self.fail('Group name must be at least 2 characters')
